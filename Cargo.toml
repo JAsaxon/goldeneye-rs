@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.28", features = ["rt-multi-thread", "macros", "signal"] }
-reqwest = { version = "0.11", features = ["rustls-tls", "cookies"] }
+reqwest = { version = "0.11", features = ["rustls-tls", "cookies","json","multipart"] }
 rand = "0.8"
 rand_chacha = "0.3"
 clap = { version = "4.1", features = ["derive"] }

